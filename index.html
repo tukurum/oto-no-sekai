@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>おとのせかい</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; overflow:hidden; background:#000;
+  -webkit-tap-highlight-color:transparent; /* iOSのタップ時の青枠を消す */
+  touch-action:manipulation;               /* ダブルタップズームを無効化 */
+}
+#stage { position:relative; width:100vw; height:100vh; overflow:hidden; }
+canvas { position:absolute; top:0; left:0; width:100%; height:100%; display:block; }
+
+#mood-badge {
+  position:absolute; top:16px; left:18px;
+  font-family:'Hiragino Sans','Noto Sans JP',sans-serif;
+  font-size:clamp(15px,2.8vw,24px); font-weight:700;
+  color:#fff; letter-spacing:0.08em; pointer-events:none;
+  text-shadow:0 0 18px rgba(200,180,255,0.9),0 0 36px rgba(160,120,255,0.4);
+  opacity:0; transition:opacity 0.5s;
+}
+#mood-badge.show { opacity:1; }
+
+#ui {
+  position:absolute; bottom:0; left:0; right:0;
+  padding:10px 14px 16px;
+  display:flex; flex-direction:column; gap:8px;
+  background:linear-gradient(transparent, rgba(0,0,0,0.62));
+  pointer-events:none;
+}
+#ui > * { pointer-events:auto; }
+.row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+#btn-mic {
+  padding:10px 24px; border-radius:99px;
+  border:2px solid rgba(255,255,255,0.32); background:rgba(255,255,255,0.09);
+  color:#fff; font-size:15px;
+  font-family:'Hiragino Sans','Noto Sans JP',sans-serif;
+  cursor:pointer; transition:all .2s;
+  touch-action:manipulation; -webkit-tap-highlight-color:transparent;
+}
+#btn-mic:hover { background:rgba(255,255,255,0.18); }
+#btn-mic.on { border-color:#ff6eb4; background:rgba(255,80,150,0.16); color:#ffb8d9; }
+.pill {
+  padding:6px 14px; border-radius:99px;
+  border:1.5px solid rgba(255,255,255,0.18); background:rgba(255,255,255,0.06);
+  color:rgba(255,255,255,0.55); font-size:13px;
+  font-family:'Hiragino Sans','Noto Sans JP',sans-serif;
+  cursor:pointer; transition:all .15s;
+  touch-action:manipulation; -webkit-tap-highlight-color:transparent;
+}
+.pill:hover  { border-color:rgba(255,255,255,0.4); color:#fff; }
+.pill.active { border-color:#fff; background:rgba(255,255,255,0.18); color:#fff; }
+.row-label   { font-size:11px; color:rgba(255,255,255,0.28); min-width:32px; font-family:monospace; }
+#sens-sl {
+  -webkit-appearance:none; width:100px; height:3px;
+  background:rgba(255,255,255,0.18); border-radius:2px; outline:none;
+}
+#sens-sl::-webkit-slider-thumb {
+  -webkit-appearance:none; width:13px; height:13px;
+  border-radius:50%; background:#fff; cursor:pointer;
+}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="c"></canvas>
+  <div id="mood-badge"></div>
+  <div id="ui">
+    <div class="row">
+      <button id="btn-mic" onclick="toggleMic()">🎤 おとをきかせて</button>
+    </div>
+    <div class="row">
+      <span class="row-label">エフェクト</span>
+      <button class="pill active" onclick="setWorld('bubbles')"   id="w-bubbles">🫧 あわ</button>
+      <button class="pill"        onclick="setWorld('particles')" id="w-particles">✦ つぶつぶ</button>
+      <button class="pill"        onclick="setWorld('rain')"      id="w-rain">🌧 あめ</button>
+      <button class="pill"        onclick="setWorld('spiral')"    id="w-spiral">🌀 うずまき</button>
+    </div>
+    <div class="row">
+      <span class="row-label">感度</span>
+      <input type="range" id="sens-sl" min="1" max="10" value="5" step="1"
+        oninput="sensitivity=+this.value">
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   SETUP
+   ============================================================ */
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const moodEl = document.getElementById('mood-badge');
+let W, H, dpr;
+
+function resize(){
+  dpr = Math.min(window.devicePixelRatio||1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width  = Math.round(W*dpr);
+  canvas.height = Math.round(H*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ★iOS Safari：バックグラウンドから戻った時にAudioContextを回復
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='visible' && audioCtx && audioCtx.state==='suspended'){
+    audioCtx.resume().catch(()=>{});
+  }
+});
+
+/* ============================================================
+   AUDIO ENGINE
+   ============================================================ */
+let audioCtx, analyser, freqBuf, timeBuf, micStream;
+let running = false;
+let sensitivity = 5;
+
+// バンド値（平滑化済み）
+let loS=0, miS=0, hiS=0, volS=0;
+// 生の瞬間値（ランダム性の源泉）
+let loRaw=0, miRaw=0, hiRaw=0, volRaw=0;
+
+async function toggleMic(){
+  const btn=document.getElementById('btn-mic');
+  if(running){
+    running=false;
+    if(micStream) micStream.getTracks().forEach(t=>t.stop());
+    if(audioCtx)  { audioCtx.close(); audioCtx=null; }
+    btn.textContent='🎤 おとをきかせて'; btn.classList.remove('on');
+    moodEl.textContent=''; moodEl.classList.remove('show');
+    return;
+  }
+  try{
+    // ★iOS Safari 対応ポイント①
+    // AudioContext はユーザーのタップジェスチャの中で「同期的に」生成する必要がある。
+    // getUserMedia（非同期）の前に作らないと suspended のまま解除できない。
+    audioCtx = new(window.AudioContext||window.webkitAudioContext)();
+
+    // ★iOS Safari 対応ポイント②
+    // iOS では生成直後に必ず suspended になる。resume() を await する。
+    if(audioCtx.state==='suspended'){
+      await audioCtx.resume();
+    }
+
+    // マイク取得（AudioContextより後）
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio:{
+        echoCancellation:false,
+        noiseSuppression:false,
+        autoGainControl:false,
+        // ★iOS Safari 対応ポイント③
+        // sampleRate 指定は iOS で拒否されることがある → 省略
+      },
+      video:false
+    });
+
+    // ★iOS Safari 対応ポイント④
+    // getUserMedia 後にもう一度 resume を試みる（一部iOSバージョンで必要）
+    if(audioCtx.state==='suspended'){
+      await audioCtx.resume();
+    }
+
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.78;
+    analyser.minDecibels = -90; analyser.maxDecibels = -10;
+    audioCtx.createMediaStreamSource(micStream).connect(analyser);
+    freqBuf = new Uint8Array(analyser.frequencyBinCount);
+    timeBuf = new Uint8Array(analyser.frequencyBinCount);
+    running=true;
+    btn.textContent='⏹ とめる'; btn.classList.add('on');
+    requestAnimationFrame(mainLoop);
+  } catch(e){
+    // エラーメッセージをわかりやすく
+    const msg={
+      'NotAllowedError':   'マイクの許可が必要です。設定→Safari→マイクを確認してください。',
+      'NotFoundError':     'マイクが見つかりません。',
+      'NotSupportedError': 'このブラウザはマイクに対応していません。',
+      'SecurityError':     'セキュリティエラー。HTTPSが必要です。',
+    };
+    btn.textContent='❌ '+(msg[e.name]||e.message);
+    if(audioCtx){ audioCtx.close(); audioCtx=null; }
+  }
+}
+
+function readAudio(){
+  // iOS Safari はバックグラウンド移行後に suspended に戻ることがある
+  if(audioCtx && audioCtx.state==='suspended'){
+    audioCtx.resume().catch(()=>{});
+  }
+  analyser.getByteFrequencyData(freqBuf);
+  analyser.getByteTimeDomainData(timeBuf);
+
+  const n=freqBuf.length, t3=(n/3)|0, s=sensitivity/5;
+  let lo=0,mi=0,hi=0,tot=0;
+  for(let i=0;   i<t3;   i++){ lo+=freqBuf[i]; tot+=freqBuf[i]; }
+  for(let i=t3;  i<t3*2; i++){ mi+=freqBuf[i]; tot+=freqBuf[i]; }
+  for(let i=t3*2;i<n;    i++){ hi+=freqBuf[i]; tot+=freqBuf[i]; }
+  const inv=1/(t3*255);
+
+  // 生の瞬間値（ランダム性の源泉）
+  loRaw=lo*inv*s; miRaw=mi*inv*s; hiRaw=hi*inv*s;
+  volRaw=tot/(n*255)*s;
+
+  // 平滑化（描画の安定に使う）
+  const k=0.2;
+  loS=loS*(1-k)+loRaw*k;
+  miS=miS*(1-k)+miRaw*k;
+  hiS=hiS*(1-k)+hiRaw*k;
+  volS=volS*0.82+(loS+miS+hiS)/3*0.18;
+
+  // ピッチ推定
+  let maxAmp=0, maxIdx=1;
+  for(let i=1;i<n;i++) if(freqBuf[i]>maxAmp){maxAmp=freqBuf[i];maxIdx=i;}
+
+  // ZCR
+  let zcr=0;
+  for(let i=1;i<timeBuf.length;i++)
+    if((timeBuf[i]-128)*(timeBuf[i-1]-128)<0) zcr++;
+
+  // スペクトル重心
+  let wSum=0,aSum=0;
+  for(let i=0;i<n;i++){wSum+=freqBuf[i]*i;aSum+=freqBuf[i];}
+
+  return{
+    lo:loS,mi:miS,hi:hiS,vol:volS,
+    loR:loRaw,miR:miRaw,hiR:hiRaw,volR:volRaw,
+    pitch:maxIdx/n,
+    zcr:zcr/timeBuf.length,
+    centroid:aSum>0?wSum/(aSum*n):0,
+    rawVol:tot/(n*255),
+  };
+}
+
+/* ============================================================
+   感情分析（60フレーム時系列）
+   ============================================================ */
+const HIST=60;
+const vH=new Float32Array(HIST),cH=new Float32Array(HIST),zH=new Float32Array(HIST);
+let histIdx=0;
+let attackTimes=[], attackCooldown=0, prevVol=0;
+const ATTACK_CD=14;
+
+let E={ energy:0,valence:0,tempo:0,roughness:0,rise:0,steady:0,mood:'---' };
+let lastMood='';
+
+function hmean(buf,n){ let s=0,c=Math.min(n,histIdx);
+  for(let k=0;k<c;k++) s+=buf[(histIdx-1-k+HIST)%HIST]; return c>0?s/c:0; }
+function hvar(buf,n){ const m=hmean(buf,n); let s=0,c=Math.min(n,histIdx);
+  for(let k=0;k<c;k++){const d=buf[(histIdx-1-k+HIST)%HIST]-m;s+=d*d;} return c>0?s/c:0; }
+
+function updateEmotion(a){
+  const i=histIdx%HIST; vH[i]=a.vol; cH[i]=a.centroid; zH[i]=a.zcr; histIdx++;
+  E.energy   = Math.min(hmean(vH,10)*3.2,1);
+  const hiR  = (a.lo+a.mi+a.hi)>0.001?a.hi/(a.lo+a.mi+a.hi):0;
+  E.valence  = Math.min(hmean(cH,20)*1.8+hiR*0.4,1);
+  const now  = performance.now();
+  attackTimes= attackTimes.filter(t=>now-t<3000);
+  let tempo=0;
+  if(attackTimes.length>=2){
+    let s=0; for(let k=1;k<attackTimes.length;k++) s+=attackTimes[k]-attackTimes[k-1];
+    const avg=s/(attackTimes.length-1);
+    tempo=Math.max(0,Math.min(1,1-(avg-200)/1800));
+  }
+  E.tempo    = tempo;
+  E.roughness= Math.min(hmean(zH,10)*4+hvar(vH,10)*20,1);
+  const rec  = hmean(vH,5), bef=hmean(vH,10)-rec/2;
+  E.rise     = Math.min(Math.max((rec-bef)*8,0),1);
+  E.steady   = a.vol>0.02?Math.max(0,1-hvar(vH,20)*40):0;
+
+  const mood=
+    E.energy<0.04           ?'しずか…':
+    E.roughness>0.6&&E.energy>0.5?'はげしい！':
+    E.tempo>0.7&&E.energy>0.4?'リズミカル♪':
+    E.energy>0.7&&E.valence>0.6?'たのしい！':
+    E.energy>0.7&&E.valence<0.3?'つよい！':
+    E.rise>0.6              ?'もりあがれ〜':
+    E.steady>0.6&&E.valence>0.5?'やさしい♩':
+    E.steady>0.6&&E.valence<0.4?'おちついた':
+    E.valence>0.7&&E.energy<0.4?'きらきら✦':
+    E.energy>0.3&&E.tempo<0.2?'ゆったり〜':'にぎやか！';
+  E.mood=mood;
+  if(mood!==lastMood){
+    lastMood=mood; moodEl.textContent=mood;
+    moodEl.classList.toggle('show', mood!=='---');
+  }
+}
+
+function detectAttack(a){
+  if(attackCooldown>0){attackCooldown--;return false;}
+  const delta=a.rawVol*(sensitivity/5)-prevVol;
+  prevVol=a.rawVol*(sensitivity/5);
+  if(delta<0.048||a.vol<0.018) return false;
+  attackCooldown=ATTACK_CD;
+  attackTimes.push(performance.now());
+  return true;
+}
+
+/* ============================================================
+   パレット・ユーティリティ
+   ============================================================ */
+const PALS={
+  bubbles:   ['#7dd3fc','#a78bfa','#5eead4','#f0abfc','#fde68a'],
+  particles: ['#fb923c','#f472b6','#facc15','#4ade80','#60a5fa','#e879f9'],
+  rain:      ['#93c5fd','#a5f3fc','#c4b5fd','#bae6fd','#e0f2fe'],
+  spiral:    ['#f9a8d4','#fda4af','#fde68a','#c084fc','#86efac','#7dd3fc'],
+};
+function pal(){ return PALS[world]||PALS.bubbles; }
+function hsl(h,s,l){ return `hsl(${h},${s}%,${l}%)`; }
+// 音から「揺れる色相」を生成（loS・hiSで色相を歪める）
+function dynamicHue(base){
+  return (base + loS*60 + hiS*40 + Math.sin(frame*0.03)*20)%360;
+}
+
+/* ============================================================
+   背景
+   ============================================================ */
+let bgPhase=0;
+function drawBackground(){
+  bgPhase+=0.003+volS*0.01;
+  const hue={bubbles:210,particles:270,rain:220,spiral:290}[world]||210;
+  ctx.fillStyle=hsl(hue,42,3+volS*6);
+  ctx.fillRect(0,0,W,H);
+}
+
+/* --- アンビエントドット --- */
+const ambDots=Array.from({length:30},()=>({
+  x:Math.random()*100,y:Math.random()*100,
+  spd:0.04+Math.random()*0.08,r:0.8+Math.random()*1.8,phase:Math.random()*Math.PI*2
+}));
+function drawAmbient(){
+  const p=pal();
+  ambDots.forEach((d,i)=>{
+    d.y-=d.spd+volS*0.35; d.x+=Math.sin(frame*0.01+d.phase)*0.2;
+    if(d.y<-5){d.y=105;d.x=Math.random()*100;}
+    ctx.globalAlpha=0.07+volS*0.1; ctx.fillStyle=p[i%p.length];
+    ctx.beginPath(); ctx.arc(d.x/100*W,d.y/100*H,d.r+volS*1.4,0,Math.PI*2); ctx.fill();
+  });
+  ctx.globalAlpha=1;
+}
+
+/* --- リング --- */
+let rings=[];
+function burstRings(energy){
+  rings.push({r:12, maxR:85+energy*Math.min(W,H)*0.4, life:1, col:pal()[0]});
+}
+function updateRings(){
+  let alive=0;
+  for(let i=0;i<rings.length;i++){
+    const r=rings[i], prog=r.r/r.maxR;
+    r.r+=3+volS*7; r.life-=0.022;
+    if(r.life>0&&r.r<r.maxR){
+      ctx.globalAlpha=r.life*(1-prog)*0.35;
+      ctx.strokeStyle=r.col; ctx.lineWidth=2*(1-prog)+0.5;
+      ctx.beginPath(); ctx.arc(W/2,H/2,r.r,0,Math.PI*2); ctx.stroke();
+      rings[alive++]=r;
+    }
+  }
+  rings.length=alive; ctx.globalAlpha=1;
+}
+
+/* ============================================================
+   🫧 あわ
+   音量・音域の瞬間値でサイズ・速度・色をリアルタイムに変化
+   アタックで大きな泡が爆発、低音で重く大きく、高音で細かく軽く
+   ============================================================ */
+let bubbles=[];
+const MAX_BUB=180;
+
+function spawnBubble(isAttack){
+  if(bubbles.length>=MAX_BUB) return;
+  // 瞬間値 loRaw/hiRaw でサイズを決定（平滑値でなく生の値でランダム性を出す）
+  const loNow=loRaw, hiNow=hiRaw, miNow=miRaw;
+  const energy=E.energy;
+
+  // サイズ：低音が多いほど大きく、高音が多いほど小さく
+  const minSz=isAttack?15:4;
+  const sz= minSz + loNow*80 + (1-hiNow)*20 + Math.random()*30;
+
+  // 速度：高音で速く・軽く、低音で遅く・重く
+  const spd= isAttack
+    ? 2+energy*6+Math.random()*4
+    : 0.3+hiNow*2.5+Math.random()*1.5;
+
+  // 方向：アタック時は全方向、通常は下から上
+  const ang= isAttack
+    ? Math.random()*Math.PI*2
+    : -Math.PI/2 + (Math.random()-0.5)*(Math.PI*0.6 + loNow*Math.PI*0.8);
+
+  // 色：音域バランスで色相を動的に変化
+  const hue= dynamicHue(180+miNow*60);
+  const sat= 60+hiNow*30;
+  const lit= 55+loNow*20;
+
+  // 生存時間：小さい泡は長持ち、大きい泡は短命
+  const decay= isAttack ? 0.006+Math.random()*0.01 : 0.003+Math.random()*0.007;
+
+  bubbles.push({
+    x: W*0.1+Math.random()*W*0.8,
+    y: isAttack ? H*0.3+Math.random()*H*0.4 : H+sz,
+    vx: Math.cos(ang)*spd + (Math.random()-0.5)*loNow*2,
+    vy: Math.sin(ang)*spd,
+    sz, life:1, decay,
+    hue, sat, lit,
+    wobble: Math.random()*Math.PI*2,
+    wobbleAmp: 0.3+hiNow*1.5,   // 高音ほどふらふら揺れる
+    wobbleSpd: 0.02+hiNow*0.06,
+  });
+}
+
+function updateDrawBubbles(isAttack){
+  // アタック：一気に噴出
+  if(isAttack){
+    const n=5+Math.floor(E.energy*18);
+    for(let i=0;i<n;i++) spawnBubble(true);
+  }
+  // 常時：音量に応じてじわじわ発生
+  if(volS>0.012){
+    const n=Math.max(1,Math.floor(volS*sensitivity*3));
+    for(let i=0;i<n;i++) spawnBubble(false);
+  }
+
+  let alive=0;
+  for(let i=0;i<bubbles.length;i++){
+    const b=bubbles[i];
+    b.wobble+=b.wobbleSpd;
+    b.x += b.vx + Math.sin(b.wobble)*b.wobbleAmp;
+    b.y += b.vy;
+    b.vy -= 0.04 + hiS*0.03;  // 高音で浮力増
+    b.vx *= 0.99;
+    b.life -= b.decay;
+    if(b.life<=0||b.y<-b.sz*2) continue;
+
+    const r=b.sz*b.life;
+    // 音量で現在の色相をリアルタイムに微調整
+    const hNow=(b.hue+loS*30+Math.sin(frame*0.02+b.wobble)*15)%360;
+
+    ctx.save(); ctx.translate(b.x,b.y);
+    ctx.globalAlpha=b.life*0.82;
+    ctx.strokeStyle=hsl(hNow,b.sat,b.lit);
+    ctx.lineWidth=Math.max(1,r*0.06);
+    ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.stroke();
+    // 内側の光
+    ctx.fillStyle=`hsla(${hNow},${b.sat}%,90%,0.06)`;
+    ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+    // ハイライト
+    ctx.fillStyle=`hsla(${hNow},80%,96%,0.3)`;
+    ctx.beginPath(); ctx.arc(-r*0.3,-r*0.32,r*0.18,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+    bubbles[alive++]=b;
+  }
+  bubbles.length=alive;
+}
+
+/* ============================================================
+   ✦ つぶつぶ
+   中心から放射。音域の瞬間値で形・サイズ・軌道が毎回違う。
+   ・loRaw → 重くゆっくり、大きい丸
+   ・hiRaw → 速く小さい星・点
+   ・miRaw → 中間の輪っか
+   ・アタック → 爆発的に全方向へ
+   ============================================================ */
+let ptBursts=[];
+const MAX_PT=320;
+
+function spawnPt(isAttack){
+  if(ptBursts.length>=MAX_PT) return;
+  const loNow=loRaw, hiNow=hiRaw, miNow=miRaw;
+  const p=pal();
+
+  // 形を音域で決定
+  const shape=
+    loNow>hiNow&&loNow>miNow ? 'circle' :
+    hiNow>loNow&&hiNow>miNow ? 'star'   : 'ring';
+
+  const ang=Math.random()*Math.PI*2;
+
+  // ★速度を大幅UP：画面端まで届く強さ
+  const spdBase= isAttack
+    ? 4+E.energy*14+Math.random()*6      // アタック：勢いよく全方向へ
+    : 2+volS*8+Math.random()*4;          // 常時：それでもしっかり飛ばす
+  const spd= spdBase * (
+    shape==='star'   ? 1.6+hiNow :
+    shape==='circle' ? 0.8+loNow :
+                       1.2+miNow );
+
+  // サイズ
+  const sz=
+    shape==='circle' ? 6+loNow*28+Math.random()*14 :
+    shape==='star'   ? 4+hiNow*16+Math.random()*8  :
+                       5+miNow*20+Math.random()*10;
+
+  // 色相
+  const hue=
+    shape==='circle' ? dynamicHue(20+loNow*40)   :
+    shape==='star'   ? dynamicHue(190+hiNow*60)   :
+                       dynamicHue(100+miNow*80);
+
+  // ★decay を遅くして画面端まで生きる
+  const decay= isAttack
+    ? 0.004+Math.random()*0.006
+    : 0.005+Math.random()*0.007;
+
+  ptBursts.push({
+    x:W/2+(Math.random()-0.5)*30,
+    y:H/2+(Math.random()-0.5)*30,
+    vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd,
+    sz, life:1, decay, shape,
+    col:p[Math.floor(Math.random()*p.length)],
+    hue,
+    rot:Math.random()*Math.PI*2,
+    rotSpd:(Math.random()-0.5)*0.08,
+  });
+}
+
+function updateDrawPt(isAttack){
+  if(isAttack){
+    const n=8+Math.floor(E.energy*22);
+    for(let i=0;i<n;i++) spawnPt(true);
+  }
+  if(volS>0.012){
+    const n=Math.max(1,Math.floor(volS*sensitivity*4));
+    for(let i=0;i<n;i++) spawnPt(false);
+  }
+
+  // 中心の光
+  ctx.globalAlpha=0.1+volS*0.32;
+  ctx.fillStyle=pal()[0];
+  ctx.beginPath(); ctx.arc(W/2,H/2,5+volS*36,0,Math.PI*2); ctx.fill();
+  ctx.globalAlpha=1;
+
+  let alive=0;
+  for(let i=0;i<ptBursts.length;i++){
+    const o=ptBursts[i];
+    o.x+=o.vx; o.y+=o.vy;
+    o.vx*=0.985; o.vy*=0.985;  // ★減速を緩くして端まで届く
+    o.rot+=o.rotSpd;
+    o.life-=o.decay;
+    if(o.life<=0) continue;
+
+    const r=o.sz*o.life;
+    const hNow=(o.hue+loS*25+hiS*20+frame*0.3)%360;
+    ctx.save(); ctx.translate(o.x,o.y); ctx.rotate(o.rot);
+    ctx.globalAlpha=o.life*0.88;
+
+    if(o.shape==='circle'){
+      ctx.fillStyle=hsl(hNow,75,65);
+      ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fill();
+    } else if(o.shape==='ring'){
+      ctx.strokeStyle=hsl(hNow,80,70);
+      ctx.lineWidth=Math.max(1,r*0.2);
+      ctx.beginPath(); ctx.arc(0,0,r*0.72,0,Math.PI*2); ctx.stroke();
+    } else { // star
+      ctx.fillStyle=hsl(hNow,90,75);
+      ctx.beginPath();
+      for(let k=0;k<10;k++){
+        const a=k*Math.PI/5-Math.PI/2;
+        const rv=k%2===0?r:r*0.42;
+        k===0?ctx.moveTo(Math.cos(a)*rv,Math.sin(a)*rv)
+             :ctx.lineTo(Math.cos(a)*rv,Math.sin(a)*rv);
+      }
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+    ptBursts[alive++]=o;
+  }
+  ptBursts.length=alive;
+}
+
+/* ============================================================
+   🌧 あめ
+   ・落下速度：音量に比例（静かなら静かな雨、激しいなら嵐）
+   ・雨粒の密度：音量で変化
+   ・横風：低音の瞬間値で左右に揺れる
+   ・長さ：高音で短い粒、低音で長い筋
+   ・アタック：水しぶき（中心から放射）
+   ============================================================ */
+let rainDrops=[], rainSplashes=[];
+const MAX_DROPS=300, MAX_SPLASH=120;
+
+// 初期雨粒プール
+function initRain(){
+  rainDrops=[];
+  for(let i=0;i<80;i++) spawnDrop(true);
+}
+
+function spawnDrop(init){
+  if(rainDrops.length>=MAX_DROPS) return;
+  const p=pal();
+  const spd=1.5+volS*8+Math.random()*3;
+  const len=4+loS*20+Math.random()*12;
+  rainDrops.push({
+    x:Math.random()*W,
+    y:init?Math.random()*H:-len,
+    vx:(Math.random()-0.5)*0.4+loRaw*6*(Math.random()>0.5?1:-1),
+    vy:spd,
+    len,
+    life:1,
+    col:p[Math.floor(Math.random()*p.length)],
+    alpha:0.3+Math.random()*0.5,
+  });
+}
+
+function spawnSplash(x,y,energy){
+  const p=pal();
+  const n=3+Math.floor(energy*8);
+  for(let i=0;i<n;i++){
+    const ang=-Math.PI+Math.random()*Math.PI; // 上半球
+    const spd=1+energy*5+Math.random()*3;
+    rainSplashes.push({
+      x,y,
+      vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd,
+      life:1, decay:0.04+Math.random()*0.04,
+      r:1+Math.random()*3+energy*4,
+      col:p[Math.floor(Math.random()*p.length)],
+    });
+  }
+}
+
+function updateDrawRain(isAttack){
+  // 密度調整：音量でスポーン数を変える
+  const newDrops=Math.max(1,Math.floor((0.5+volS*6)*sensitivity*0.5));
+  for(let i=0;i<newDrops;i++) spawnDrop(false);
+
+  // アタック：水しぶき
+  if(isAttack){
+    const sx=W*0.1+Math.random()*W*0.8;
+    const sy=H*0.4+Math.random()*H*0.5;
+    spawnSplash(sx,sy,E.energy);
+  }
+
+  // 雨粒
+  let alive=0;
+  for(let i=0;i<rainDrops.length;i++){
+    const d=rainDrops[i];
+    // 横風：loRaw の瞬間値で毎フレーム微妙にぶれる
+    d.vx += (loRaw-0.1)*(Math.random()-0.5)*0.3;
+    d.vx *= 0.96;
+    d.x  += d.vx;
+    d.y  += d.vy*(1+volS*3);
+
+    if(d.y>H+d.len){
+      // 地面に当たったら水しぶき
+      if(Math.random()<0.15+volS*0.3) spawnSplash(d.x,H,volS*0.6);
+      continue;
+    }
+    if(d.x<-20||d.x>W+20) continue;
+
+    // 色：高音で明るく白っぽく
+    const alpha=d.alpha*(0.4+hiS*0.5);
+    ctx.save();
+    ctx.globalAlpha=alpha;
+    ctx.strokeStyle=d.col;
+    ctx.lineWidth=Math.max(0.8,1+loS*1.5);
+    ctx.beginPath();
+    ctx.moveTo(d.x, d.y);
+    // 落下方向に合わせて筋を引く
+    const len=d.len*(1+volS*1.5);
+    ctx.lineTo(d.x-d.vx*(len/d.vy), d.y-len);
+    ctx.stroke();
+    ctx.restore();
+    rainDrops[alive++]=d;
+  }
+  rainDrops.length=alive;
+
+  // しぶき
+  let salive=0;
+  for(let i=0;i<rainSplashes.length;i++){
+    const s=rainSplashes[i];
+    s.x+=s.vx; s.y+=s.vy; s.vy+=0.15; s.vx*=0.95;
+    s.life-=s.decay;
+    if(s.life<=0) continue;
+    ctx.save();
+    ctx.globalAlpha=s.life*0.75;
+    ctx.fillStyle=s.col;
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r*s.life,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+    rainSplashes[salive++]=s;
+  }
+  rainSplashes.length=salive;
+}
+
+/* ============================================================
+   🌀 うずまき
+   ・腕の本数：高音成分で 3〜7本に変化（★最低3本に増加）
+   ・展開速度：音量+低音
+   ・湾曲：★より強く密に巻く
+   ・点の太さ：音量でリアルタイムに脈打つ
+   ・アタック：spiralBoost で瞬間加速＋全腕リセット
+   ============================================================ */
+const MAX_ARMS=7;                               // ★最大7本
+const armH=Array.from({length:MAX_ARMS},()=>[]);
+const MAX_APT=400;                              // ★履歴を長くして渦を太く
+let sAngle=0, sBoost=0, activeArms=3;
+
+function resetSpiral(){
+  for(let a=0;a<MAX_ARMS;a++) armH[a].length=0;
+  sAngle=0;
+}
+
+function updateDrawSpiral(isAttack){
+  if(isAttack){
+    sBoost+=0.15+E.energy*0.3;
+    if(E.energy>0.4) resetSpiral();
+  }
+  sBoost*=0.86;
+
+  const p=pal();
+  const maxR=Math.sqrt(W*W+H*H)*0.54;
+
+  // 腕の数：高音が多いほど増える（★3〜7本）
+  activeArms=Math.min(MAX_ARMS, 3+Math.floor(hiS*16));
+
+  // 展開速度
+  const speed=0.01+volS*0.09+loS*0.06+sBoost;
+
+  // ★湾曲を強める：巻きが密になって渦らしくなる
+  const curve=0.018+loS*0.05+miS*0.02;
+
+  sAngle+=speed;
+
+  for(let arm=0;arm<activeArms;arm++){
+    const hist=armH[arm];
+    const baseAng=sAngle+(arm/activeArms)*Math.PI*2;
+    let headR=hist.length>0?hist[hist.length-1].r+speed*14*(1+volS*3.5):0;
+    if(headR>maxR){ headR=0; hist.length=0; }
+
+    const ang=baseAng+headR*curve;
+    const x=W/2+Math.cos(ang)*headR;
+    const y=H/2+Math.sin(ang)*headR;
+
+    // 点の太さ
+    const ptR=0.5+(headR/maxR)*(2.5+volS*16+loS*10);
+    const col=p[(Math.floor(headR/25)+arm)%p.length];  // ★色の切り替わりを細かく
+
+    if(hist.length>=MAX_APT) hist.shift();
+    hist.push({x,y,r:headR,ptR,col});
+  }
+  for(let arm=activeArms;arm<MAX_ARMS;arm++) armH[arm].length=0;
+
+  // ★描画：不透明度を上げてくっきり見せる
+  for(let arm=0;arm<activeArms;arm++){
+    const hist=armH[arm];
+    const len=hist.length;
+    for(let i=0;i<len;i++){
+      const pt=hist[i], f=i/len;
+      ctx.globalAlpha=f*0.92;
+      ctx.fillStyle=pt.col;
+      ctx.beginPath(); ctx.arc(pt.x,pt.y,pt.ptR*f,0,Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.globalAlpha=1;
+
+  // 中心輝点
+  ctx.globalAlpha=0.3+volS*0.55;
+  ctx.fillStyle=p[0];
+  ctx.beginPath(); ctx.arc(W/2,H/2,3+volS*20+loS*12,0,Math.PI*2); ctx.fill();
+  ctx.globalAlpha=1;
+}
+
+/* ============================================================
+   WORLD 管理
+   ============================================================ */
+let world='bubbles', frame=0;
+
+function setWorld(w){
+  world=w;
+  bubbles.length=0; ptBursts.length=0;
+  rainSplashes.length=0;
+  resetSpiral(); sBoost=0;
+  if(w==='rain') initRain();
+  ['bubbles','particles','rain','spiral'].forEach(x=>
+    document.getElementById('w-'+x).classList.toggle('active',x===w));
+}
+
+/* ============================================================
+   MAIN LOOP
+   ============================================================ */
+let fpsT=performance.now();
+
+function mainLoop(){
+  if(!running) return;
+  frame++;
+  const audio=readAudio();
+  updateEmotion(audio);
+  const isAttack=detectAttack(audio);
+
+  drawBackground();
+  drawAmbient();
+
+  // リング（全ワールド共通）
+  if(isAttack) burstRings(E.energy);
+  updateRings();
+
+  // ワールド別
+  if     (world==='bubbles')   updateDrawBubbles(isAttack);
+  else if(world==='particles') updateDrawPt(isAttack);
+  else if(world==='rain')      updateDrawRain(isAttack);
+  else if(world==='spiral')    updateDrawSpiral(isAttack);
+
+  requestAnimationFrame(mainLoop);
+}
+
+/* ============================================================
+   IDLE
+   ============================================================ */
+let idleF=0;
+function idleLoop(){
+  if(running) return;
+  idleF++;
+  ctx.fillStyle='#06060f'; ctx.fillRect(0,0,W,H);
+  drawAmbient();
+  ctx.save();
+  ctx.globalAlpha=0.42+Math.sin(idleF*0.04)*0.18;
+  ctx.fillStyle='#fff'; ctx.shadowColor='#aaaaff'; ctx.shadowBlur=16;
+  ctx.font=`${Math.min(W*0.037,20)}px 'Hiragino Sans','Noto Sans JP',sans-serif`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('🎤 マイクを起動して、おとをならそう！',W/2,H/2);
+  ctx.restore();
+  requestAnimationFrame(idleLoop);
+}
+initRain();
+idleLoop();
+</script>
+</body>
+</html>
