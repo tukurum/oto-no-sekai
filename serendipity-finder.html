@@ -470,6 +470,13 @@
             return suggested.pop() || null;
         }
 
+        // コピー時に混ざりやすい全角文字・空白・見えない文字を取り除く
+        function cleanApiKey(value) {
+            return value
+                .normalize('NFKC')
+                .replace(/[\s\u200B-\u200D\u2060\uFEFF]/g, '');
+        }
+
         function getMockData(query) {
             if (mockDatabase[query]) return mockDatabase[query];
             const key = Object.keys(mockDatabase).find(k => k !== 'default' && query.includes(k));
@@ -485,13 +492,16 @@
             submitBtn.disabled = true;
             window.scrollTo({ top: 0, behavior: 'smooth' });
 
-            const apiKey = apiKeyInput.value.trim();
+            const apiKey = cleanApiKey(apiKeyInput.value);
             let data;
             let message = '';
 
             if (!apiKey) {
                 data = getMockData(query);
                 message = 'Gemini APIキーが未入力のため、サンプルデータを表示しています。';
+            } else if (!/^[A-Za-z0-9_-]+$/.test(apiKey)) {
+                data = getMockData(query);
+                message = 'APIキーに使えない文字が含まれています。Google AI Studioでキーの「コピー」ボタンを押し、もう一度貼り付けてください。（代わりにサンプルデータを表示しています）';
             } else {
                 try {
                     data = await fetchFromGemini(query, apiKey, wantMore);
