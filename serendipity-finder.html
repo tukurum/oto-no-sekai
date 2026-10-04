@@ -208,7 +208,7 @@
 
         <div id="loading" class="loading hidden" role="status" aria-live="polite">
             <div class="spinner" aria-hidden="true"></div>
-            <p>新しい繋がりを探索中…</p>
+            <p id="loading-text">新しい繋がりを探索中…</p>
         </div>
 
         <div id="results-container" class="results hidden">
@@ -392,7 +392,7 @@
                 }
             });
 
-            let res = await generate(activeModel, apiKey, body);
+            let res = await generateWithRetry(activeModel, apiKey, body);
             if (!res.ok && isModelUnavailable(res)) {
                 // モデルが提供終了・未対応のとき、使える別のFlashモデルで1回だけやり直す
                 const next = await findFlashModel(apiKey, activeModel, res.errMsg);
@@ -401,7 +401,15 @@
                     res = await generate(activeModel, apiKey, body);
                 }
             }
-            if (!res.ok) throw new Error(`APIエラー: ${res.errMsg}`);
+            if (!res.ok && isBusy(res)) {
+                // 混雑が続くときは、別のFlashモデル（Flash-Liteを含む）で1回だけ試す
+                const alt = await findFlashModel(apiKey, activeModel, '', true);
+                if (alt) {
+                    setLoadingText(`混み合っているため、別のモデル（${alt}）で試しています…`);
+                    res = await generate(alt, apiKey, body);
+                }
+            }
+            if (!res.ok) throw new Error(friendlyError(res));
 
             let jsonStr = res.result.candidates?.[0]?.content?.parts?.[0]?.text;
             if (!jsonStr) throw new Error('無効なAPIレスポンスです');
@@ -442,12 +450,38 @@
             return { ok: true, result: await response.json() };
         }
 
+        const wait = (ms) => new Promise(r => setTimeout(r, ms));
+        const setLoadingText = (t) => { document.getElementById('loading-text').textContent = t; };
+
+        // 一時的な混雑（503など）なら、間をあけて最大2回やり直す
+        async function generateWithRetry(model, apiKey, body) {
+            const delays = [2000, 5000];
+            let res = await generate(model, apiKey, body);
+            for (let i = 0; i < delays.length && !res.ok && isBusy(res); i++) {
+                setLoadingText(`混み合っています。${delays[i] / 1000}秒後にもう一度試します…（${i + 2}/${delays.length + 1}回目）`);
+                await wait(delays[i]);
+                res = await generate(model, apiKey, body);
+            }
+            return res;
+        }
+
+        function isBusy(res) {
+            return [500, 503].includes(res.status) || /high demand|overloaded|try again later/i.test(res.errMsg);
+        }
+
+        function friendlyError(res) {
+            if (isBusy(res)) return 'Geminiが混み合っています。少し時間をおいてもう一度お試しください';
+            if (res.status === 429) return '無料枠の利用回数の上限に達しました。しばらく待ってからお試しください';
+            if (res.status === 400 && /API key/i.test(res.errMsg)) return 'APIキーが正しくありません。Google AI Studioでキーを確認してください';
+            return `APIエラー: ${res.errMsg}`;
+        }
+
         function isModelUnavailable(res) {
             return res.status === 404 || /no longer available|not found|not supported/i.test(res.errMsg);
         }
 
         // このキーで使えるFlashモデルの中から、いちばん新しい正式版を選ぶ
-        async function findFlashModel(apiKey, current, errMsg) {
+        async function findFlashModel(apiKey, current, errMsg, allowLite = false) {
             try {
                 const response = await fetch(`${API_BASE}/models?pageSize=1000`, {
                     headers: { 'x-goog-api-key': apiKey }
@@ -457,7 +491,7 @@
                     const candidates = models
                         .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
                         .map(m => m.name.replace(/^models\//, ''))
-                        .filter(n => /^gemini-[\d.]+-flash$/.test(n) && n !== current)
+                        .filter(n => (allowLite ? /^gemini-[\d.]+-flash(-lite)?$/ : /^gemini-[\d.]+-flash$/).test(n) && n !== current)
                         .sort((a, b) => parseFloat(b.split('-')[1]) - parseFloat(a.split('-')[1]));
                     if (candidates.length) return candidates[0];
                 }
@@ -488,6 +522,7 @@
             inputHint.classList.add('hidden');
             searchArea.classList.add('hidden');
             resultsContainer.classList.add('hidden');
+            setLoadingText('新しい繋がりを探索中…');
             loadingSection.classList.remove('hidden');
             submitBtn.disabled = true;
             window.scrollTo({ top: 0, behavior: 'smooth' });
