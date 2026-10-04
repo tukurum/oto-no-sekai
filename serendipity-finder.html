@@ -257,8 +257,10 @@
 
     <script>
         // --- 設定 ---
-        // Google AI Studio で使えるモデル名に合わせて変更してください
-        const GEMINI_MODEL = 'gemini-2.5-flash';
+        // 最初に試すモデル。提供終了などで使えないときは、使えるFlashモデルを自動で探して切り替える
+        const GEMINI_MODEL = 'gemini-3.8-flash';
+        const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+        let activeModel = GEMINI_MODEL;
 
         // --- モックデータ（APIキー未入力・エラー時のフォールバック） ---
         const mockDatabase = {
@@ -381,39 +383,27 @@
                 ? `キーワード: ${query}\n前回とは違う、さらに意外な分野から提案してください。`
                 : `キーワード: ${query}`;
 
-            // 応答がないまま止まらないよう、30秒で打ち切る
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 30000);
-            const response = await fetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-goog-api-key': apiKey
-                    },
-                    body: JSON.stringify({
-                        systemInstruction: { parts: [{ text: systemPrompt }] },
-                        contents: [{ role: 'user', parts: [{ text: userText }] }],
-                        generationConfig: {
-                            responseMimeType: 'application/json',
-                            temperature: wantMore ? 1.2 : 0.9
-                        }
-                    }),
-                    signal: controller.signal
+            const body = JSON.stringify({
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                contents: [{ role: 'user', parts: [{ text: userText }] }],
+                generationConfig: {
+                    responseMimeType: 'application/json',
+                    temperature: wantMore ? 1.2 : 0.9
                 }
-            ).catch((err) => {
-                throw new Error(err.name === 'AbortError' ? '応答に時間がかかりすぎました' : `通信エラー: ${err.message}`);
-            }).finally(() => clearTimeout(timer));
+            });
 
-            if (!response.ok) {
-                const errData = await response.json().catch(() => ({}));
-                const errMsg = errData.error?.message || `HTTP ${response.status}`;
-                throw new Error(`APIエラー: ${errMsg}`);
+            let res = await generate(activeModel, apiKey, body);
+            if (!res.ok && isModelUnavailable(res)) {
+                // モデルが提供終了・未対応のとき、使える別のFlashモデルで1回だけやり直す
+                const next = await findFlashModel(apiKey, activeModel, res.errMsg);
+                if (next) {
+                    activeModel = next;
+                    res = await generate(activeModel, apiKey, body);
+                }
             }
+            if (!res.ok) throw new Error(`APIエラー: ${res.errMsg}`);
 
-            const result = await response.json();
-            let jsonStr = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            let jsonStr = res.result.candidates?.[0]?.content?.parts?.[0]?.text;
             if (!jsonStr) throw new Error('無効なAPIレスポンスです');
 
             const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
@@ -424,6 +414,60 @@
                 throw new Error('想定外の形式で返ってきました');
             }
             return data;
+        }
+
+        async function generate(model, apiKey, body) {
+            // 応答がないまま止まらないよう、30秒で打ち切る
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 30000);
+            const response = await fetch(
+                `${API_BASE}/models/${model}:generateContent`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': apiKey
+                    },
+                    body,
+                    signal: controller.signal
+                }
+            ).catch((err) => {
+                throw new Error(err.name === 'AbortError' ? '応答に時間がかかりすぎました' : `通信エラー: ${err.message}`);
+            }).finally(() => clearTimeout(timer));
+
+            if (!response.ok) {
+                const errData = await response.json().catch(() => ({}));
+                return { ok: false, status: response.status, errMsg: errData.error?.message || `HTTP ${response.status}` };
+            }
+            return { ok: true, result: await response.json() };
+        }
+
+        function isModelUnavailable(res) {
+            return res.status === 404 || /no longer available|not found|not supported/i.test(res.errMsg);
+        }
+
+        // このキーで使えるFlashモデルの中から、いちばん新しい正式版を選ぶ
+        async function findFlashModel(apiKey, current, errMsg) {
+            try {
+                const response = await fetch(`${API_BASE}/models?pageSize=1000`, {
+                    headers: { 'x-goog-api-key': apiKey }
+                });
+                if (response.ok) {
+                    const { models = [] } = await response.json();
+                    const candidates = models
+                        .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+                        .map(m => m.name.replace(/^models\//, ''))
+                        .filter(n => /^gemini-[\d.]+-flash$/.test(n) && n !== current)
+                        .sort((a, b) => parseFloat(b.split('-')[1]) - parseFloat(a.split('-')[1]));
+                    if (candidates.length) return candidates[0];
+                }
+            } catch (e) {
+                console.warn('モデル一覧の取得に失敗:', e);
+            }
+            // 一覧が取れないときは、エラー文で案内されたモデル名を使う
+            const suggested = [...(errMsg || '').matchAll(/models\/(gemini-[\w.-]+)/g)]
+                .map(m => m[1]).filter(n => n !== current);
+            return suggested.pop() || null;
         }
 
         function getMockData(query) {
