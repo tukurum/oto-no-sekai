@@ -343,6 +343,8 @@
         const noticeText = $('notice-text');
 
         let lastQuery = '';
+        let lastShownQuery = '';
+        let shownNames = []; // 表示中の提案名（「もっと」で重複を避けるため）
 
         // --- Events ---
         searchForm.addEventListener('submit', (e) => {
@@ -378,9 +380,29 @@
         });
 
         // --- Gemini API ---
-        async function fetchFromGemini(query, apiKey, wantMore) {
-            const userText = wantMore
-                ? `キーワード: ${query}\n前回とは違う、さらに意外な分野から提案してください。`
+        // 返してほしいJSONの形をGeminiに指定する（形が崩れた返答を防ぐ）
+        const itemSchema = (withConnection) => ({
+            type: 'OBJECT',
+            properties: {
+                type: { type: 'STRING' },
+                name: { type: 'STRING' },
+                desc: { type: 'STRING' },
+                ...(withConnection ? { short: { type: 'STRING' }, connection: { type: 'STRING' } } : {})
+            },
+            required: withConnection ? ['type', 'name', 'desc', 'short', 'connection'] : ['type', 'name', 'desc']
+        });
+        const responseSchema = {
+            type: 'OBJECT',
+            properties: {
+                direct: { type: 'ARRAY', items: itemSchema(false) },
+                serendipity: { type: 'ARRAY', items: itemSchema(true) }
+            },
+            required: ['direct', 'serendipity']
+        };
+
+        async function fetchFromGemini(query, apiKey, exclude = []) {
+            const userText = exclude.length
+                ? `キーワード: ${query}\n次の提案はすでに出したので、これらとは違う、さらに意外な分野から提案してください：${exclude.join('、')}`
                 : `キーワード: ${query}`;
 
             const body = JSON.stringify({
@@ -388,10 +410,24 @@
                 contents: [{ role: 'user', parts: [{ text: userText }] }],
                 generationConfig: {
                     responseMimeType: 'application/json',
-                    temperature: wantMore ? 1.2 : 0.9
+                    responseSchema
                 }
             });
 
+            // 返答の形が崩れていたら、1回だけ取り直す
+            for (let attempt = 1; ; attempt++) {
+                const res = await requestWithFallbacks(apiKey, body);
+                try {
+                    return parseResult(res);
+                } catch (error) {
+                    console.warn('返答の解析に失敗:', error);
+                    if (attempt >= 2) throw new Error('AIの返答をうまく読み取れませんでした。もう一度お試しください');
+                    setLoadingText('返答を読み取れなかったため、もう一度問い合わせています…');
+                }
+            }
+        }
+
+        async function requestWithFallbacks(apiKey, body) {
             let res = await generateWithRetry(activeModel, apiKey, body);
             if (!res.ok && isModelUnavailable(res)) {
                 // モデルが提供終了・未対応のとき、使える別のFlashモデルで1回だけやり直す
@@ -410,16 +446,19 @@
                 }
             }
             if (!res.ok) throw new Error(friendlyError(res));
+            return res;
+        }
 
-            let jsonStr = res.result.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!jsonStr) throw new Error('無効なAPIレスポンスです');
+        function parseResult(res) {
+            let jsonStr = res.result.candidates?.[0]?.content?.parts?.find(part => part.text && !part.thought)?.text;
+            if (!jsonStr) throw new Error('空の返答');
 
             const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
             if (jsonMatch) jsonStr = jsonMatch[0];
             const data = JSON.parse(jsonStr);
 
-            if (!Array.isArray(data.direct) || !Array.isArray(data.serendipity)) {
-                throw new Error('想定外の形式で返ってきました');
+            if (!Array.isArray(data.direct) || !Array.isArray(data.serendipity) || !data.serendipity.length) {
+                throw new Error('想定外の形式');
             }
             return data;
         }
@@ -518,6 +557,8 @@
         }
 
         async function processSearch(query, wantMore = false) {
+            // 「もっと」が失敗したときに今の結果を残せるよう、表示前の状態を覚えておく
+            const canKeepCurrent = wantMore && query === lastQuery && shownNames.length > 0;
             lastQuery = query;
             inputHint.classList.add('hidden');
             searchArea.classList.add('hidden');
@@ -539,9 +580,17 @@
                 message = 'APIキーに使えない文字が含まれています。Google AI Studioでキーの「コピー」ボタンを押し、もう一度貼り付けてください。（代わりにサンプルデータを表示しています）';
             } else {
                 try {
-                    data = await fetchFromGemini(query, apiKey, wantMore);
+                    data = await fetchFromGemini(query, apiKey, wantMore ? shownNames : []);
                 } catch (error) {
                     console.error('Gemini Error:', error);
+                    if (canKeepCurrent) {
+                        // 新しい提案が取れなかったときは、今の結果をそのまま残す
+                        showNotice(`${error.message}（いまの結果をそのまま表示しています）`);
+                        loadingSection.classList.add('hidden');
+                        resultsContainer.classList.remove('hidden');
+                        submitBtn.disabled = false;
+                        return;
+                    }
                     data = getMockData(query);
                     message = `${error.message}（代わりにサンプルデータを表示しています）`;
                 }
@@ -559,15 +608,23 @@
             }[c]));
         }
 
+        function showNotice(message) {
+            noticeText.textContent = message;
+            notice.classList.toggle('hidden', !message);
+        }
+
         function displayResults(data, query, message) {
             loadingSection.classList.add('hidden');
             queryDisplay.textContent = `「${query}」`;
 
-            noticeText.textContent = message;
-            notice.classList.toggle('hidden', !message);
+            showNotice(message);
 
             const direct = data.direct.slice(0, 4);
             const serendipity = data.serendipity.slice(0, 4);
+            // 「もっと」を重ねても重複しないよう、これまでの提案名を積み上げる（直近20件まで）
+            const names = [...direct, ...serendipity].map(item => item.name).filter(Boolean);
+            shownNames = (query === lastShownQuery ? [...shownNames, ...names] : names).slice(-20);
+            lastShownQuery = query;
             directResultsDiv.innerHTML = direct.map((item, i) => createCardHTML(item, i + 1)).join('');
             serendipityResultsDiv.innerHTML = serendipity
                 .map((item, i) => createSerendipityCardHTML(item, direct.length + i + 1, query))
