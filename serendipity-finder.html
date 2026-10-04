@@ -196,7 +196,7 @@
                     Gemini APIキー <span class="sub">（Google AI Studio）</span>
                 </label>
                 <div class="row">
-                    <input type="password" id="api-key-input" placeholder="AIza…" autocomplete="off">
+                    <input type="password" id="api-key-input" placeholder="AIza…" autocomplete="off" data-lpignore="true" data-1p-ignore spellcheck="false">
                     <p class="note">ブラウザから直接Gemini APIを呼び出すために使います。キーは保存されません。未入力の場合はサンプルデータで表示します。</p>
                 </div>
                 <a class="text-link" href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">
@@ -545,9 +545,19 @@
 
         // コピー時に混ざりやすい全角文字・空白・見えない文字を取り除く
         function cleanApiKey(value) {
-            return value
+            const cleaned = value
                 .normalize('NFKC')
-                .replace(/[\s\u200B-\u200D\u2060\uFEFF]/g, '');
+                .replace(/[\s\u200B-\u200D\u2060\uFEFF]/g, '')
+                .replace(/^["'`「『]+|["'`」』]+$/g, '');
+            // 「APIキー: AIza…」のように余計な文字ごと貼られても、キーの部分だけを取り出す
+            const found = cleaned.match(/AIza[0-9A-Za-z_-]{30,}/);
+            return found ? found[0] : cleaned;
+        }
+
+        // 通信で送れない文字（半角英数記号以外）を見つける
+        function invalidKeyChars(key) {
+            const bad = [...new Set(key.replace(/[\x21-\x7E]/g, ''))];
+            return bad.map(c => c === '…' ? '…（三点リーダー）' : `「${c}」`).slice(0, 5);
         }
 
         function getMockData(query) {
@@ -575,9 +585,9 @@
             if (!apiKey) {
                 data = getMockData(query);
                 message = 'Gemini APIキーが未入力のため、サンプルデータを表示しています。';
-            } else if (!/^[A-Za-z0-9_-]+$/.test(apiKey)) {
+            } else if (invalidKeyChars(apiKey).length) {
                 data = getMockData(query);
-                message = 'APIキーに使えない文字が含まれています。Google AI Studioでキーの「コピー」ボタンを押し、もう一度貼り付けてください。（代わりにサンプルデータを表示しています）';
+                message = `APIキー欄に使えない文字（${invalidKeyChars(apiKey).join(' ')}）が入っています。欄を一度すべて消してから、Google AI Studioでコピーしたキーを貼り付けてください。（代わりにサンプルデータを表示しています）`;
             } else {
                 try {
                     data = await fetchFromGemini(query, apiKey, wantMore ? shownNames : []);
